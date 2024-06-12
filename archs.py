@@ -580,7 +580,7 @@ class Scale_reduce(nn.Module):
         return reduce_out
 
 
-class UNext(nn.Module):
+class GFRNet(nn.Module):
 
 
     def __init__(self, num_classes, input_channels=3, deep_supervision=False, img_size=224, patch_size=16, in_chans=3,
