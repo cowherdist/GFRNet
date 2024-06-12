@@ -865,10 +865,3 @@ class UNext(nn.Module):
         out = F.relu(F.interpolate(self.decoder5(out), scale_factor=(2, 2), mode='bilinear'))
 
         return self.final(out)
-
-if __name__ == '__main__':
-    x = torch.randn(1, 3, 224, 224).cuda(0)
-    net = UNext(1, 3, 3, False).cuda(0)
-    flops, params = profile(net, inputs=(x,))
-    print('模型参数量：%.2f M' % (params / 1e6))
-    print('FLOPs：%.2f G' % (flops / 1e9))
