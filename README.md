@@ -1,7 +1,7 @@
 # Pytorch Code for GFRNet GFRNet
 # Use archs.py to replace the network model part of your own project 
-# Use losses.py to replace the loss part
-of your own model.
+# Use losses.py to replace  your own loss.
+
 
 ## Using the code:
 
