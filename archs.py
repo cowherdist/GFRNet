@@ -1,15 +1,5 @@
 import torch
-from torch import nn
-import torch
-import torchvision
-from torch import nn
-from torch.autograd import Variable
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from torchvision.utils import save_image
 import torch.nn.functional as F
-import os
-import matplotlib.pyplot as plt
 from utils import *
 
 __all__ = ['GFRNet']
@@ -18,39 +8,197 @@ import timm
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import types
 import math
-from abc import ABCMeta, abstractmethod
-from mmcv.cnn import ConvModule
-import pdb
 import settings
+from thop import profile
+
+####################################添加backbone#############
+
+class Bottle2neck(nn.Module):
+    expansion = 4
+    def __init__(self, inplanes, planes, stride=1, downsample=None, baseWidth=26, scale=4, stype='normal'):
+        super(Bottle2neck, self).__init__()
+        width = int(math.floor(planes * (baseWidth / 64.0)))
+        self.conv1 = nn.Conv2d(inplanes, width * scale, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(width * scale)
+
+        if scale == 1:
+            self.nums = 1
+        else:
+            self.nums = scale - 1
+        if stype == 'stage':
+            self.pool = nn.AvgPool2d(kernel_size=3, stride=stride, padding=1)
+        convs = []
+        bns = []
+        for i in range(self.nums):
+            convs.append(nn.Conv2d(width, width, kernel_size=3, stride=stride, padding=1, bias=False))
+            bns.append(nn.BatchNorm2d(width))
+        self.convs = nn.ModuleList(convs)
+        self.bns = nn.ModuleList(bns)
+        self.conv3 = nn.Conv2d(width * scale, planes * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stype = stype
+        self.scale = scale
+        self.width = width
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        spx = torch.split(out, self.width, 1)
+        for i in range(self.nums):
+            if i == 0 or self.stype == 'stage':
+                sp = spx[i]
+            else:
+                sp = sp + spx[i]
+            sp = self.convs[i](sp)
+            sp = self.relu(self.bns[i](sp))
+            if i == 0:
+                out = sp
+            else:
+                out = torch.cat((out, sp), 1)
+        if self.scale != 1 and self.stype == 'normal':
+            out = torch.cat((out, spx[self.nums]), 1)
+        elif self.scale != 1 and self.stype == 'stage':
+            out = torch.cat((out, self.pool(spx[self.nums])), 1)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
 
 
-class MatrixDecomposition(nn.Module):
+class Res2Net(nn.Module):
+
+    def __init__(self, block, layers, baseWidth=26, scale=4, num_classes=1000):
+        self.inplanes = 64
+        super(Res2Net, self).__init__()
+        self.baseWidth = baseWidth
+        self.scale = scale
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, 1, 1, bias=False)
+        )
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.AvgPool2d(kernel_size=stride, stride=stride,
+                             ceil_mode=True, count_include_pad=False),
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=1, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample=downsample,
+                            stype='stage', baseWidth=self.baseWidth, scale=self.scale))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes, baseWidth=self.baseWidth, scale=self.scale))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+
+        return x
+
+
+def res2net50_v1b(pretrained=False, **kwargs):
+    model = Res2Net(Bottle2neck, [3, 4, 6, 3], baseWidth=26, scale=4, **kwargs)
+    if pretrained:
+        model.load_state_dict(model_zoo.load_url(model_urls['res2net50_v1b_26w_4s']))
+    return model
+
+
+def res2net101_v1b(pretrained=False, **kwargs):
+    model = Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4, **kwargs)
+    if pretrained:
+        model.load_state_dict(model_zoo.load_url(model_urls['res2net101_v1b_26w_4s']))
+    return model
+
+
+def res2net50_v1b_26w_4s(pretrained=False, **kwargs):
+    model = Res2Net(Bottle2neck, [3, 4, 6, 3], baseWidth=26, scale=4, **kwargs)
+    if pretrained:
+        model_state = torch.load('Snapshots/Res2net/res2net50.pth')
+        model.load_state_dict(model_state)
+        # lib.load_state_dict(model_zoo.load_url(model_urls['res2net50_v1b_26w_4s']))
+    return model
+
+
+def res2net101_v1b_26w_4s(pretrained=False, **kwargs):
+    model = Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4, **kwargs)
+    if pretrained:
+        model.load_state_dict(model_zoo.load_url(model_urls['res2net101_v1b_26w_4s']))
+    return model
+
+
+def res2net152_v1b_26w_4s(pretrained=False, **kwargs):
+    model = Res2Net(Bottle2neck, [3, 8, 36, 3], baseWidth=26, scale=4, **kwargs)
+    if pretrained:
+        model.load_state_dict(model_zoo.load_url(model_urls['res2net152_v1b_26w_4s']))
+    return model
+
+
+class _MatrixDecomposition2DBase(nn.Module):
     def __init__(self, args):
         super().__init__()
 
         self.spatial = getattr(args, 'SPATIAL', True)
-
         self.S = getattr(args, 'MD_S', 1)
         self.D = getattr(args, 'MD_D', 512)
         self.R = getattr(args, 'MD_R', 64)
-
         self.train_steps = getattr(args, 'TRAIN_STEPS', 2)
         self.eval_steps = getattr(args, 'EVAL_STEPS', 2)
-
         self.inv_t = getattr(args, 'INV_T', 100)
         self.eta = getattr(args, 'ETA', 0.9)
-
         self.rand_init = getattr(args, 'RAND_INIT', True)
-
-        print('spatial', self.spatial)
-        print('S', self.S)
-        print('D', self.D)
-        print('R', self.R)
-        print('train_steps', self.train_steps)
-        print('eval_steps', self.eval_steps)
-        print('inv_t', self.inv_t)
-        print('eta', self.eta)
-        print('rand_init', self.rand_init)
 
     def _build_bases(self, B, S, D, R, cuda=False):
         raise NotImplementedError
@@ -118,9 +266,6 @@ class MatrixDecomposition(nn.Module):
         if not self.rand_init and not self.training and not return_bases:
             self.online_update(bases)
 
-        # if not self.rand_init or return_bases:
-        #     return x, bases
-        # else:
         return x
 
     @torch.no_grad()
@@ -131,7 +276,7 @@ class MatrixDecomposition(nn.Module):
         self.bases = F.normalize(self.bases, dim=1)
 
 
-class NMF(MatrixDecomposition:
+class NMF2D(_MatrixDecomposition2DBase):
     def __init__(self, args):
         super().__init__(args)
 
@@ -179,15 +324,9 @@ class NMF(MatrixDecomposition:
 def get_hams(key):
     # hams = {'VQ':VQ2D,
     #         'CD':CD2D,
-    #         'NMF':NMF}
+    #         'NMF':NMF2D}
     hams = {
-        'NMF': NMF
-
-
-
-
-
-    }
+        'NMF': NMF2D}
     assert key in hams
 
     return hams[key]
@@ -203,19 +342,61 @@ class EfficientSelfAttenHam(nn.Module):
         self.ham = HAM(args)  # 调用NMF2D，并把args传递给HAM
         self.dw = DWConv(dim)
         self.proj = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+        modules = []
+        hidden_channels = dim // 2
+        modules.append(nn.Sequential(
+            nn.Conv2d(dim, hidden_channels, 1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True)))
+        modules.append(nn.Sequential(
+            nn.Conv2d(dim, hidden_channels, 3, padding=1, dilation=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True)))
+        modules.append(nn.Sequential(
+            nn.Conv2d(dim, hidden_channels, 3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True)))
+        modules.append(nn.Sequential(
+            nn.Conv2d(dim, hidden_channels, 3, padding=4, dilation=4, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True)))
+        modules.append(nn.Sequential(
+            nn.Conv2d(dim, hidden_channels, 3, padding=6, dilation=6, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True)))
+        self.convs = nn.ModuleList(modules)
+
+        self.conv_out = nn.Conv2d(5 * hidden_channels, 1, 1, bias=False)
+
 
     def forward(self, x: torch.Tensor, H, W) -> torch.Tensor:
         B, N, C = x.shape
         x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()  # (B,C,H,W)
-        _, _, H, W, = x.shape
         x = self.ham(x)
         x = x.reshape(B, N, -1).contiguous()  # (B,C,N)
+        x = self.dw(x, H, W)
+        x = self.norm(x)
+        x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        _, _, H, W, = x.shape
+        mx = x
 
-        x = self.dw(x, H, W)  # 加上位置编码后再继续
-        out = self.proj(x)
+        res = []
+        for conv in self.convs:
+            res.append(conv(mx))
+        res = torch.cat(res, dim=1)
+        weight = torch.sigmoid(self.conv_out(res))
+        mx = mx * weight + mx
+        # print(weight.shape)
+        mx = mx.reshape(B, H, W, C)
 
-        return out
+        # x = self.ham(mx)  # 在MCM模块中，矩阵分解此时传入的是一个四维张量  并且H已经变成了H*W，而W就变成了1，
+        x = mx.reshape(B, N, -1).contiguous()  # (B,C,N)
+        x = self.norm(x)
+        # x = self.dw(x, H, W)  # 加上位置编码后再继续，在MCM模块中，H、W仍然是不准确的
+        # out = self.proj(x)
 
+        return x
 
 ##################################################################################
 
@@ -253,23 +434,13 @@ class TransformerBlockHam(nn.Module):
     def forward(self, x: torch.Tensor, H, W) -> torch.Tensor:
 
         tx = x + self.attn(self.act(self.norm1(x)), H, W)  # 先LayerNorm，再relu后，再送入矩阵分解模块
-        mx = tx + self.mlp(self.norm2(tx), H, W)
+        mx =  self.norm2(tx)
         return mx
 
 
 def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=1, bias=False)
-
-
-def shift(dim):
-    x_shift = [torch.roll(x_c, shift, dim) for x_c, shift in zip(xs, range(-self.pad, self.pad + 1))]
-    x_cat = torch.cat(x_shift, 1)
-    x_cat = torch.narrow(x_cat, 2, self.pad, H)
-    x_cat = torch.narrow(x_cat, 3, self.pad, W)
-    return x_cat
-
-
 
 
 class DWConv(nn.Module):
@@ -325,9 +496,6 @@ class OverlapPatchEmbed(nn.Module):
         # 输出图片尺寸：C是160，H和W是32，B不变
         x = self.proj(x)
         _, _, H, W = x.shape
-
-        # print("##########################")
-        # print(x.shape)
 
         x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
@@ -412,12 +580,11 @@ class Scale_reduce(nn.Module):
         return reduce_out
 
 
-class GFRnet(nn.Module):
-
+class UNext(nn.Module):
 
 
     def __init__(self, num_classes, input_channels=3, deep_supervision=False, img_size=224, patch_size=16, in_chans=3,
-                 embed_dims=[128, 160, 256],
+                 embed_dims=[512, 160, 256],
                  num_heads=[1, 2, 4, 8], mlp_ratios=[4, 4, 4, 4], qkv_bias=False, qk_scale=None, drop_rate=0.,
                  attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
                  depths=[1, 1, 1], sr_ratios=[8, 4, 2, 1], **kwargs):
@@ -435,46 +602,27 @@ class GFRnet(nn.Module):
         self.norm4 = norm_layer(embed_dims[2])
 
         self.dnorm3 = norm_layer(160)
-        self.dnorm4 = norm_layer(128)
-
-        # self.addnorm1 = nn.LayerNorm(128)
+        self.dnorm4 = norm_layer(512)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-
-        # self.block1 = nn.ModuleList([shiftedBlock(
-        #     dim=embed_dims[1], num_heads=num_heads[0], mlp_ratio=1, qkv_bias=qkv_bias, qk_scale=qk_scale,
-        #     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer,
-        #     sr_ratio=sr_ratios[0])])
         self.block1 = nn.ModuleList([
-            # TransformerBlock(dims[0], heads[0], reduction_ratios[0],token_mlp)
-            TransformerBlockHam(embed_dims[1], 'mix_skip')  # 通道数必须改成64
+            TransformerBlockHam(embed_dims[1], 'mix_skip'),
+            TransformerBlockHam(embed_dims[1], 'mix_skip')  #
         ])
 
-        # self.block2 = nn.ModuleList([shiftedBlock(
-        #     dim=embed_dims[2], num_heads=num_heads[0], mlp_ratio=1, qkv_bias=qkv_bias, qk_scale=qk_scale,
-        #     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[1], norm_layer=norm_layer,
-        #     sr_ratio=sr_ratios[0])])
         self.block2 = nn.ModuleList([
-            # TransformerBlock(dims[0], heads[0], reduction_ratios[0],token_mlp)
-            TransformerBlockHam(embed_dims[2], 'mix_skip')  # 通道数必须改成64
+            TransformerBlockHam(embed_dims[2], 'mix_skip'),  #
+            TransformerBlockHam(embed_dims[2], 'mix_skip')
         ])
 
-        # self.dblock1 = nn.ModuleList([shiftedBlock(
-        #     dim=embed_dims[1], num_heads=num_heads[0], mlp_ratio=1, qkv_bias=qkv_bias, qk_scale=qk_scale,
-        #     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer,
-        #     sr_ratio=sr_ratios[0])])
         self.dblock1 = nn.ModuleList([
-            # TransformerBlock(dims[0], heads[0], reduction_ratios[0],token_mlp)
-            TransformerBlockHam(embed_dims[1], 'mix_skip')  # 通道数必须改成64
+            TransformerBlockHam(embed_dims[1], 'mix_skip'),  #
+            TransformerBlockHam(embed_dims[1], 'mix_skip')
         ])
 
-        # self.dblock2 = nn.ModuleList([shiftedBlock(
-        #     dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=1, qkv_bias=qkv_bias, qk_scale=qk_scale,
-        #     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[1], norm_layer=norm_layer,
-        #     sr_ratio=sr_ratios[0])])
         self.dblock2 = nn.ModuleList([
-            # TransformerBlock(dims[0], heads[0], reduction_ratios[0],token_mlp)
-            TransformerBlockHam(embed_dims[0], 'mix_skip')  # 通道数必须改成64
+            TransformerBlockHam(embed_dims[0], 'mix_skip'),#
+            TransformerBlockHam(embed_dims[0], 'mix_skip')
         ])
 
         self.patch_embed3 = OverlapPatchEmbed(img_size=img_size // 4, patch_size=3, stride=2, in_chans=embed_dims[0],
@@ -483,38 +631,42 @@ class GFRnet(nn.Module):
                                               embed_dim=embed_dims[2])
 
         self.decoder1 = nn.Conv2d(256, 160, 3, stride=1, padding=1)
-        self.decoder2 = nn.Conv2d(160, 128, 3, stride=1, padding=1)
-        self.decoder3 = nn.Conv2d(128, 32, 3, stride=1, padding=1)
-        self.decoder4 = nn.Conv2d(32, 16, 3, stride=1, padding=1)
-        self.decoder5 = nn.Conv2d(16, 16, 3, stride=1, padding=1)
+        self.decoder2 = nn.Conv2d(160, 512, 3, stride=1, padding=1)
+        self.decoder3 = nn.Conv2d(512, 256, 3, stride=1, padding=1)
+        self.decoder4 = nn.Conv2d(256, 64, 3, stride=1, padding=1)
+        self.decoder5 = nn.Conv2d(64, 16, 3, stride=1, padding=1)
 
         self.dbn1 = nn.BatchNorm2d(160)
-        self.dbn2 = nn.BatchNorm2d(128)
-        self.dbn3 = nn.BatchNorm2d(32)
-        self.dbn4 = nn.BatchNorm2d(16)
+        self.dbn2 = nn.BatchNorm2d(512)
+        self.dbn3 = nn.BatchNorm2d(256)
+        self.dbn4 = nn.BatchNorm2d(64)
 
         self.final = nn.Conv2d(16, num_classes, kernel_size=1)
 
         self.soft = nn.Softmax(dim=1)
 
-        self.changeC1 = conv1x1(16, 128)
-        self.changeC2 = conv1x1(32, 128)
-        self.changeC3 = conv1x1(128, 128)
+        self.changeC1 = conv1x1(64, 128)
+        self.changeC2 = conv1x1(256, 128)
+        self.changeC3 = conv1x1(512, 128)
         self.changeC4 = conv1x1(160, 128)
         self.changeC5 = conv1x1(256, 128)
 
-        self.restore1 = conv1x1(128, 16)
-        self.restore2 = conv1x1(128, 32)
-        self.restore3 = conv1x1(128, 128)
+        self.restore1 = conv1x1(128, 64)
+        self.restore2 = conv1x1(128, 256)
+        self.restore3 = conv1x1(128, 512)
         self.restore4 = conv1x1(128, 160)
         self.restore5 = conv1x1(128, 256)
         self.normrestore = nn.LayerNorm(128)
+        self.normMix = nn.BatchNorm2d(128)
+        self.proj = nn.Linear(128, 128)
 
         self.mixfeature = TransformerBlockHam(128, 'mix_skip')
         self.reduction_ratios = None
         self.addfeature = M_EfficientSelfAtten(160, 1, self.reduction_ratios)
         self.addfeature2 = M_EfficientSelfAtten(256, 1, self.reduction_ratios)
-        self.addfeature3 = M_EfficientSelfAtten(128, 1, self.reduction_ratios)
+        self.addfeature3 = M_EfficientSelfAtten(512, 1, self.reduction_ratios)
+        ###############################添加backbone###########################
+        self.resnet = res2net50_v1b_26w_4s(pretrained=True)
 
     def forward(self, x):
 
@@ -523,21 +675,22 @@ class GFRnet(nn.Module):
         ### Conv Stage
         Container = []
 
-        # 卷积输出图片尺寸：(224-3+2)/1  + 1 = 224,池化输出尺寸：112，也是输出尺寸
-        out = F.relu(F.max_pool2d(self.ebn1(self.encoder1(x)), 2, 2))
-        t1 = out
+        ################################添加backbone############################
+        # print(x.shape)  #torch.Size([16, 3, 224, 224])
+        x = self.resnet.conv1(x)
+        # print(x.shape)  #torch.Size([16, 64, 112, 112])
+        x = self.resnet.bn1(x)
+        t1 = self.resnet.relu(x)
         Container.append(t1)  # 112
 
-        # 通道数变成：32；图片尺寸变成：56；
-        out = F.relu(F.max_pool2d(self.ebn2(self.encoder2(out)), 2, 2))
-        t2 = out
+        x = self.resnet.maxpool(t1)
+        t2 = self.resnet.layer1(x)
         Container.append(t2)  # 56
+        # print(t2.shape) #torch.Size([16, 256, 56, 56])
 
-        ### Stage 3：
-        # 通道数变成：128；图片尺寸变成：28；
-        out = F.relu(F.max_pool2d(self.ebn3(self.encoder3(out)), 2, 2))
-        t3 = out
+        t3 = self.resnet.layer2(t2)
         Container.append(t3)  # 28
+        out = t3
 
         # #################################分割线：上面提取局部特征，下面提取全局特征###########################
         # 图片尺寸变成14，通道变成160，先改变图片尺寸，再送入矩阵分解模块
@@ -547,8 +700,10 @@ class GFRnet(nn.Module):
             out = blk(out, H, W)
         out = self.norm3(out)
         addout = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+
         t4 = addout
         Container.append(t4)  # 14
+        # heartmap = t4
         # 自注意力
         addout = self.addfeature(out)
         addout = self.norm3(addout)
@@ -557,10 +712,12 @@ class GFRnet(nn.Module):
         out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         tmpt4 = out
         Container.append(tmpt4)
-
-        ### Bottleneck
+        heartmap = tmpt4
         # 图片尺寸变成7，通道数变成256
         out, H, W = self.patch_embed4(out)
+        # addoutshape = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+
+        ### Bottleneck
         # 矩阵分解
         for i, blk in enumerate(self.block2):
             out = blk(out, H, W)
@@ -568,6 +725,7 @@ class GFRnet(nn.Module):
         addoutshape = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         t5 = addoutshape
         Container.append(t5)  # 矩阵分解结果加入容器
+
         # 自注意力
         addout2 = self.addfeature2(out)
         addout2 = self.norm4(addout2)
@@ -576,11 +734,6 @@ class GFRnet(nn.Module):
         out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         tmpt5 = out
         Container.append(tmpt5)
-        # print(Container[0].shape)   #torch.Size([16, 16, 112, 112])
-        # print(Container[1].shape)   #torch.Size([16, 32, 56, 56])
-        # print(Container[2].shape)   #torch.Size([16, 128, 28, 28])
-        # print(Container[3].shape)   #torch.Size([16, 160, 14, 14])
-        # print(Container[4].shape)   #torch.Size([16, 256, 7, 7])  (B、C、H、W)
 
         conOut1 = self.changeC1(Container[0])  # t1   112
         conOut2 = self.changeC2(Container[1])  # t2   56
@@ -589,11 +742,6 @@ class GFRnet(nn.Module):
         conOut5 = self.changeC4(Container[4])  # tmpt4  14
         conOut6 = self.changeC5(Container[5])  # t5     7
         conOut7 = self.changeC5(Container[6])  # tmpt5  7
-        # print(conOut1.shape)   #torch.Size([16, 128, 112, 112])
-        # print(conOut2.shape)   #torch.Size([16, 128, 56, 56])
-        # print(conOut3.shape)   #torch.Size([16, 128, 28, 28])
-        # print(conOut4.shape)   #torch.Size([16, 128, 14, 14])
-        # print(conOut5.shape)   #torch.Size([16, 128, 7, 7])
 
         c1f = conOut1.permute(0, 2, 3, 1).reshape(B, -1, 128)
         c1f = self.normrestore(c1f)
@@ -609,20 +757,14 @@ class GFRnet(nn.Module):
         c6f = self.normrestore(c6f)
         c7f = conOut7.permute(0, 2, 3, 1).reshape(B, -1, 128)
         c7f = self.normrestore(c7f)
-        # print(c1f.shape)   #torch.Size([16, 12544, 128])
-        # print(c2f.shape)   #torch.Size([16, 3136, 128])
-        # print(c3f.shape)   #torch.Size([16, 784, 128])
-        # print(c4f.shape)   #torch.Size([16, 196, 128])
-        # print(c5f.shape)   #torch.Size([16, 196, 128])
-        # print(c6f.shape)   #torch.Size([16, 49, 128])
-        # print(c7f.shape)   #torch.Size([16, 49, 128])
 
         seq = torch.cat([c1f, c2f, c3f, c4f, c5f, c6f, c7f], -2)
         # print(seq.shape)   #torch.Size([16, 16954, 128])
+        
+        seq = self.proj(seq)
         seqout = self.mixfeature(seq, 16954, 1)
         seqout = self.normrestore(seqout)
         # print(seqout.shape)   #torch.Size([16, 16709, 128])
-
         seqfinal = seq + seqout
         seqfinal = self.normrestore(seqfinal)
 
@@ -649,30 +791,36 @@ class GFRnet(nn.Module):
         t6 = tem6.reshape(B, 7, 7, 128).permute(0, 3, 1, 2).contiguous()
         t7 = tem7.reshape(B, 7, 7, 128).permute(0, 3, 1, 2).contiguous()
         t1 = self.restore1(t1)
+        t1 = t1 + Container[0]
         t2 = self.restore2(t2)
+        t2 = t2 + Container[1]
         t3 = self.restore3(t3)
+        t3 = t3 + Container[2]
         t4 = self.restore4(t4)
+        t4 = t4 + Container[3]
         t5 = self.restore4(t5)
+        t5 = t5 + Container[4]
         t6 = self.restore5(t6)
+        t6 = t6 + Container[5]
         t7 = self.restore5(t7)
-        # print(t1.shape)   #torch.Size([16, 112, 112, 128])
-        # print(t2.shape)   #torch.Size([16, 56, 56, 128])
-        # print(t3.shape)   #torch.Size([16, 28, 28, 128])
-        # print(t4.shape)   #torch.Size([16, 14, 14, 128])
-        # print(t5.shape)   #torch.Size([16, 7, 7, 128])
-
+        t7 = t7 + Container[6]
         ################################编码器结束，以下是解码器########################################
-
-        t7 = torch.add(t7, t6)  # 自注意力->矩阵分解
+        # t7 = self.addfeature2(t7)
+        # t7 = self.norm4(t7)
+        t7 = torch.add(t7, t6)  #
+        # print(t7.shape)  # torch.Size([16, 256, 7, 7])
         ### Stage 4
         # 瓶颈层先上采样，得到和上一层特征图尺寸一样的图14 160
         out = F.relu(F.interpolate(self.dbn1(self.decoder1(t7)), scale_factor=(2, 2), mode='bilinear'))
         _, _, H, W = out.shape
+        # print(out.shape)    # torch.Size([16, 160, 14, 14])
         out = out.flatten(2).transpose(1, 2)
+        # print(out.shape)  # torch.Size([16, 196, 160])
         # 自注意力
         addout = self.addfeature(out)
         addout = self.dnorm3(addout)
         addout = addout.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        # print(addout.shape)  # torch.Size([16, 196, 160])
         out = torch.add(addout, t5)
         # 矩阵分解
         _, _, H, W = out.shape
@@ -683,20 +831,30 @@ class GFRnet(nn.Module):
         out = self.dnorm3(out)
         out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         out = torch.add(out, t4)
-
+        # print(out.shape)
         # 然后如上述一样依次进行  28
-        out = F.relu(F.interpolate(self.dbn2(self.decoder2(out)), scale_factor=(2, 2), mode='bilinear'))
-        out = torch.add(out, t3)
+        out = self.decoder2(out)
+        # print(out.shape)
+        out = F.relu(F.interpolate(self.dbn2(out), scale_factor=(2, 2), mode='bilinear'))
+        #print(out.shape)
+
+        _, _, H, W = out.shape
+        # print(out.shape)    # torch.Size([16, 160, 14, 14])
+        out = out.flatten(2).transpose(1, 2)
+        # print(out.shape)  # torch.Size([16, 196, 160])
+        # 自注意力
+        addout = self.addfeature3(out)
+        addout = self.dnorm4(addout)
+        addout = addout.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+
+        out = torch.add(addout, t3)
+        # 矩阵分解
         _, _, H, W = out.shape
         out = out.flatten(2).transpose(1, 2)
-
         for i, blk in enumerate(self.dblock2):
             out = blk(out, H, W)
-
         out = self.dnorm4(out)
-        addout = self.addfeature3(out)
-        addout = self.normrestore(addout)
-        out = addout
+
         out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         # 56
         out = F.relu(F.interpolate(self.dbn3(self.decoder3(out)), scale_factor=(2, 2), mode='bilinear'))
@@ -708,10 +866,9 @@ class GFRnet(nn.Module):
 
         return self.final(out)
 
-
 if __name__ == '__main__':
-    x = torch.randn(2, 3, 224, 224).cuda(0)
-    net = GFRnet(3, 3, False).cuda(0)
-
-    print(net(x).shape)
-    print("Total number of parameters in networks is {} M".format(sum(x.numel() for x in net.parameters()) / 1e6))
+    x = torch.randn(1, 3, 224, 224).cuda(0)
+    net = UNext(1, 3, 3, False).cuda(0)
+    flops, params = profile(net, inputs=(x,))
+    print('模型参数量：%.2f M' % (params / 1e6))
+    print('FLOPs：%.2f G' % (flops / 1e9))
