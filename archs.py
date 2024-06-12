@@ -390,10 +390,10 @@ class EfficientSelfAttenHam(nn.Module):
         # print(weight.shape)
         mx = mx.reshape(B, H, W, C)
 
-        # x = self.ham(mx)  # 在MCM模块中，矩阵分解此时传入的是一个四维张量  并且H已经变成了H*W，而W就变成了1，
+        # x = self.ham(mx)  # 
         x = mx.reshape(B, N, -1).contiguous()  # (B,C,N)
         x = self.norm(x)
-        # x = self.dw(x, H, W)  # 加上位置编码后再继续，在MCM模块中，H、W仍然是不准确的
+        # x = self.dw(x, H, W)  # 
         # out = self.proj(x)
 
         return x
@@ -503,7 +503,7 @@ class OverlapPatchEmbed(nn.Module):
         return x, H, W
 
 
-################################自注意力消融实验#########################################
+################################自注意力#########################################
 
 class M_EfficientSelfAtten(nn.Module):
     def __init__(self, dim, head, reduction_ratio):
