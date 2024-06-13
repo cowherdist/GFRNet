@@ -11,10 +11,8 @@ The code is stable while using Python 3.6.13, CUDA >=10.1
 
 To install all the dependencies using conda:
 
-```bash
-conda env create -f environment.yml
-conda activate GFRNet
-```
+
+
 
 If you prefer pip, install following versions:
 
